@@ -1,4 +1,4 @@
-#!usr/bin/env python3
+#!/usr/bin/env python3
 import os
 import sys
 import threading
@@ -65,8 +65,8 @@ def proxy_handler(client_conn, addr):
         t1.start()
         t2.start()
     except Exception as e:
-        #print(f"Error handling client connection: {e}")
-        pass
+        print(f"Error handling client connection: {e}")
+        #pass
     finally:
         client_conn.close()
 
@@ -100,8 +100,8 @@ def piping(src, dst, extract=False):
                     extract_queue.put(full_request)
                     buffer = buffer[total_length:]
     except Exception as e:
-        #print(f"Error in piping: {e}")
-        pass
+        print(f"Error in piping: {e}")
+        #pass
     finally:
         src.close()
         dst.close()
