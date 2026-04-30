@@ -196,6 +196,7 @@ static int callback(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_
 
 void CLEAN_IPTABLES(){
     system("iptables -t raw -D PREROUTING -p udp --dport 53 -j NFQUEUE --queue-num 0");
+    system("sudo iptables -A OUTPUT -p icmp --icmp-type redirect -j ACCEPT");
     system("sudo iptables -F");
     system("sudo iptables -t nat -F");
     if(qh)nfq_destroy_queue(qh);
