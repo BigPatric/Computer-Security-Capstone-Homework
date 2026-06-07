@@ -69,7 +69,7 @@ def main():
     # Guidance: Since the password is not random and is likely based on the victim's personal info,
     # we do not need to generate all permutations up to length 8 (which is 109,600 combinations).
     # Humans typically combine 1 to 2 words. By limiting the permutation length to 2 words,
-    # we reduce the search space to 64 combinations, making the guess much faster and practical.
+    # we significantly reduce the search space, making the guess much faster and practical.
     all_passwords = []
     for r in range(1, 3):
         for comb in itertools.permutations(information_row, r):
