@@ -1,0 +1,45 @@
+version: '3'
+services:
+  secure_random: 
+    build: ./secure_random/
+    volumes:
+      - ./secure_random/secure_random:/home/secure_random:ro
+    ports:
+      - "30171:8888"
+    environment:
+      - FLAG=FLAG{n0t_53cur3_4t_4ll_EXP}
+  simple_shell: 
+    build: ./simple_shell/
+    volumes:
+      - ./simple_shell/simple_shell:/home/simple_shell:ro
+    ports:
+      - "30172:8888"
+  shop: 
+    build: ./shop/
+    volumes:
+      - ./shop/shop:/home/shop:ro
+    ports:
+      - "30173:8888"
+  ret2flag:
+    build: ./ret2flag/
+    volumes:
+      - ./ret2flag/ret2flag:/home/ret2flag:ro
+    ports:
+      - "30174:8888"
+    environment:
+      - FLAG=FLAG{l3ak_can4ry_and_4ddress_is_us3fu1_FLAG}
+  hard_rop:
+    build: ./hard_rop/
+    volumes:
+      - ./hard_rop/hard_rop:/home/hard_rop:ro
+    ports:
+      - "30176:8888"
+  agenthacker:
+    build: ./agenthacker/
+    volumes:
+      - ./agenthacker/agenthacker:/home/agenthacker:ro
+    ports:
+      - "30175:8888"
+      
+  
+    
