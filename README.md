@@ -22,9 +22,9 @@ This repository is for the CSC-2026 homework recordings, by BigPatric (Hsin-Ze W
     └── project4-servers/          # Dockerized challenge services
 ```
 
-## Projects
+## Projects Details
 
-- [Project 1: TLS hijacking](project1/112550018-project1/README.md)
-- [Project 2: MITM, DoH, and pharming](project2/112550018-project2/README.md)
-- [Project 3: Ransomware propagation and payload](project3/112550018-project3/README.md)
-- [Project 4: CTF and binary exploitation](project4/112550018-project4/)
+- [Project 1: TLS hijacking](project1/README.md)
+- [Project 2: MITM, DoH, and pharming](project2/README.md)
+- [Project 3: Ransomware propagation and payload](project3/README.md)
+- [Project 4: CTF and binary exploitation](project4/README.md)
